@@ -9,6 +9,9 @@ import (
 
 	"github.com/streadway/amqp"
 	"github.com/upfluence/goutils/log"
+	"crypto/tls"
+	"crypto/x509"
+	"io/ioutil"
 )
 
 // AMQPChannel is an interface over amqp.Channel
@@ -53,7 +56,7 @@ type RabbitMQTransport struct {
 	Channel        AMQPChannel
 	ClosingChannel chan bool
 	Configs        []*TransportConfig
-	dialer         func(string) (AMQPConnection, error)
+	dialer         func(string, *tls.Config) (AMQPConnection, error)
 	dialerConfig   func(string, amqp.Config) (AMQPConnection, error)
 }
 
@@ -68,10 +71,10 @@ func NewRabbitMQTransport(uri string) (*RabbitMQTransport, error) {
 	return NewRabbitMQHATransport([]*TransportConfig{config}), nil
 }
 
-func amqpDialer(url string) (AMQPConnection, error) {
+func amqpDialer(url string, amqps *tls.Config) (AMQPConnection, error) {
 	var conn = &Connection{}
 	var err error
-	conn.Connection, err = amqp.Dial(url)
+	conn.Connection, err = amqp.DialTLS(url, amqps)
 
 	return conn, err
 }
@@ -100,6 +103,65 @@ func (t *RabbitMQTransport) GetClosingChan() chan bool {
 	return t.ClosingChannel
 }
 
+// tlsConfig returns a valid tls.Config if required or nil otherwise
+// Since the dialer uses amqp.DialTLS we must ALWAYS provide a tls.Config (or nil)
+func tlsConfig(t *TransportConfig) *tls.Config {
+
+	// Check for TLS keys in config
+	switch {
+	case t.Ssl.CaCertFile == "":
+		log.Notice("TLS disabled. option missing: CaCertFile")
+		return nil
+	case t.Ssl.CertChainFile == "":
+		log.Notice("TLS disabled. option missing: CertChainFile")
+		return nil
+	case t.Ssl.PrivateKeyFile == "":
+		log.Notice("TLS disabled. option missing: PrivateKeyFile")
+		return nil
+	}
+
+	// Create new tls config
+	tlsCfg := new(tls.Config)
+
+	// Load root CA
+	tlsCfg.RootCAs = x509.NewCertPool()
+
+	if ca, err := ioutil.ReadFile(t.Ssl.CaCertFile); err == nil {
+		tlsCfg.RootCAs.AppendCertsFromPEM(ca)
+		if len(tlsCfg.RootCAs.Subjects()) == 0 {
+			log.Fatalf(
+				"Invalid x509 CA certificate file: %s",
+				t.Ssl.CaCertFile,
+			)
+		}
+		log.Notice(
+			"Total CA certificates loaded in chain:",
+			len(tlsCfg.RootCAs.Subjects()),
+		)
+	} else {
+		log.Fatalf(
+			"Failed to read specified CA certificate file: %s with error: %s",
+			t.Ssl.CaCertFile,
+			err,
+		)
+	}
+
+	// Load TLS KeyPair
+	if cert, err := tls.LoadX509KeyPair(t.Ssl.CertChainFile, t.Ssl.PrivateKeyFile); err == nil {
+		tlsCfg.Certificates = append(tlsCfg.Certificates, cert)
+		log.Notice("Successfully loaded TLS keypair")
+	} else {
+		log.Fatalf(
+			"Failed to load TLS keypair: %s and %s with error: %s",
+			t.Ssl.CertChainFile,
+			t.Ssl.PrivateKeyFile,
+			err,
+		)
+	}
+
+	return tlsCfg
+}
+
 func (t *RabbitMQTransport) Connect() error {
 	var (
 		uri           string
@@ -114,7 +176,8 @@ func (t *RabbitMQTransport) Connect() error {
 
 		log.Noticef("Trying to connect to URI: %s", uri)
 
-		// TODO: Add SSL support via amqp.DialTLS
+		// get TLS config
+		tc := tlsConfig(config)
 
 		if heartbeatString := config.Heartbeat.String(); heartbeatString != "" {
 			var heartbeat time.Duration
@@ -131,10 +194,13 @@ func (t *RabbitMQTransport) Connect() error {
 
 			t.Connection, err = t.dialerConfig(
 				uri,
-				amqp.Config{Heartbeat: heartbeat},
+				amqp.Config{
+					Heartbeat: heartbeat,
+					TLSClientConfig: tc,
+				},
 			)
 		} else {
-			t.Connection, err = t.dialer(uri)
+			t.Connection, err = t.dialer(uri, tc)
 		}
 
 		if err != nil {

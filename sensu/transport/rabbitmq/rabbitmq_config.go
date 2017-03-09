@@ -20,14 +20,21 @@ type TransportConfig struct {
 	Heartbeat json.Number `json:"heartbeat,omitempty"`
 	Prefetch  json.Number `json:"prefetch,omitempty"`
 	Ssl       struct {
+		CaCertFile     string `json:"ca_cert_file,omitempty"`
 		CertChainFile  string `json:"cert_chain_file,omitempty"`
 		PrivateKeyFile string `json:"private_key_file,omitempty"`
 	} `json:"ssl,omitempty"`
 }
 
 func (c *TransportConfig) GetURI() string {
+	scheme := "amqp"
+	if c.Ssl.CaCertFile != "" && c.Ssl.CertChainFile != "" && c.Ssl.PrivateKeyFile != "" {
+		scheme = "amqps"
+	}
+
 	return fmt.Sprintf(
-		"amqp://%s:%s@%s:%s/%s",
+		"%s://%s:%s@%s:%s/%s",
+		scheme,
 		c.User,
 		c.Password,
 		c.Host,
